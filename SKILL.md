@@ -7,7 +7,7 @@ license: MIT
 repository: https://github.com/mvanhorn/clawdbot-skill-supabase
 homepage: https://supabase.com
 metadata:
-  clawdbot:
+  openclaw:
     emoji: "🟩"
     requires:
       env:
