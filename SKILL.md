@@ -1,19 +1,47 @@
 ---
 name: supabase
-description: Connect to Supabase for database operations, vector search, and storage. Use for storing data, running SQL queries, similarity search with pgvector, and managing tables. Triggers on requests involving databases, vector stores, embeddings, or Supabase specifically.
-metadata: {"clawdbot":{"requires":{"env":["SUPABASE_URL","SUPABASE_SERVICE_KEY"]}}}
+version: "1.1.0"
+description: Connect to Supabase for database operations, vector search, and storage. SQL queries, CRUD, pgvector similarity search, and table management. Note: Supabase is migrating to new project-scoped API keys starting March 11, 2026.
+author: mvanhorn
+license: MIT
+repository: https://github.com/mvanhorn/clawdbot-skill-supabase
+homepage: https://supabase.com
+metadata:
+  clawdbot:
+    emoji: "🟩"
+    requires:
+      env:
+        - SUPABASE_URL
+        - SUPABASE_SERVICE_KEY
+    optionalEnv:
+      - SUPABASE_API_KEY
+      - SUPABASE_ACCESS_TOKEN
+    primaryEnv: SUPABASE_URL
+    tags:
+      - database
+      - postgres
+      - vector-search
+      - pgvector
+      - supabase
 ---
 
 # Supabase CLI
 
 Interact with Supabase projects: queries, CRUD, vector search, and table management.
 
+> **API Key Migration (March 2026):** Supabase is deprecating legacy service keys starting March 11, 2026.
+> Get your new project-scoped key: Dashboard → Settings → API → API Keys.
+> Set `SUPABASE_API_KEY` going forward. Legacy `SUPABASE_SERVICE_KEY` still works until late 2026.
+
 ## Setup
 
 ```bash
 # Required
 export SUPABASE_URL="https://yourproject.supabase.co"
-export SUPABASE_SERVICE_KEY="eyJhbGciOiJIUzI1NiIs..."
+export SUPABASE_SERVICE_KEY="eyJhbGciOiJIUzI1NiIs..."  # legacy — use SUPABASE_API_KEY for new projects
+
+# New project-scoped key (preferred, March 2026+)
+export SUPABASE_API_KEY="sbp_..."
 
 # Optional: for management API
 export SUPABASE_ACCESS_TOKEN="sbp_xxxxx"
