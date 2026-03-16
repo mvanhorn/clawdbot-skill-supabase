@@ -1,7 +1,7 @@
 ---
 name: supabase
-version: "2.0.0"
-description: Full Supabase database toolkit - schema explorer, natural language queries, migration management, RLS policy helper, pgvector search, data export, health monitoring.
+version: "3.0.0"
+description: Full Supabase database toolkit - schema explorer, natural language queries, CRUD, pgvector search, RLS policies, migrations, health checks, data export, Warehouse analytics, auto-embeddings, queues, Realtime, OAuth 2.1, Storage CDN, Edge Functions.
 author: mvanhorn
 license: MIT
 repository: https://github.com/mvanhorn/clawdbot-skill-supabase
@@ -29,6 +29,20 @@ triggers:
   - similarity search
   - stored procedure
   - database size
+  - warehouse
+  - duckdb
+  - analytics
+  - auto-embeddings
+  - queues
+  - pgmq
+  - realtime
+  - presence
+  - broadcast
+  - oauth
+  - storage
+  - edge functions
+  - stripe sync
+  - log drains
 metadata:
   openclaw:
     emoji: "\U0001F7E9"
@@ -60,16 +74,30 @@ metadata:
       - natural-language-query
       - csv
       - json
+      - warehouse
+      - duckdb
+      - analytics
+      - queues
+      - pgmq
+      - realtime
+      - oauth
+      - storage
+      - edge-functions
+      - stripe-sync
+      - log-drains
 ---
 
 # Supabase Database Toolkit
 
-Full database toolkit for Supabase projects: schema explorer, natural language queries, CRUD, vector search, RLS policy helper, migrations, health checks, and data export.
+Full database toolkit for Supabase projects: schema explorer, natural language queries, CRUD, vector search, RLS policy helper, migrations, health checks, data export, Warehouse analytics (pg_duckdb), automatic embeddings, queues (pgmq), Realtime, OAuth 2.1, Storage CDN, and Edge Functions.
 
 > **API Key Migration (March 2026):** Supabase is deprecating legacy service keys starting March 11, 2026.
-> New project-scoped keys use the `sbp_` prefix. Get yours: Dashboard -> Settings -> API -> API Keys.
+> New project-scoped keys use the `sb_publishable_` and `sb_secret_` prefixes. Get yours: Dashboard -> Settings -> API -> API Keys.
 > Set `SUPABASE_API_KEY` for new projects. Legacy `SUPABASE_SERVICE_KEY` continues to work until late 2026.
 > See the [Migration Guide](#api-key-migration-guide-march-2026) section below for step-by-step instructions.
+
+> **OpenAPI spec restricted (March 11, 2026):** The auto-generated OpenAPI spec is now restricted to `service_role` keys only.
+> Anon-key requests to `/rest/v1/` no longer return the spec. This hardens the default attack surface.
 
 ## Setup
 
@@ -79,7 +107,7 @@ export SUPABASE_URL="https://yourproject.supabase.co"
 export SUPABASE_SERVICE_KEY="eyJhbGciOiJIUzI1NiIs..."  # legacy - use SUPABASE_API_KEY for new projects
 
 # New project-scoped key (preferred, March 2026+)
-export SUPABASE_API_KEY="sbp_..."
+export SUPABASE_API_KEY="sb_secret_..."
 
 # Optional: for management API (org-level operations)
 export SUPABASE_ACCESS_TOKEN="sbp_xxxxx"
@@ -114,6 +142,463 @@ export OPENAI_API_KEY="sk-..."
 
 # Export data as CSV
 {baseDir}/scripts/supabase.sh export users --format csv > users.csv
+
+# Analytics query via Warehouse (pg_duckdb)
+{baseDir}/scripts/supabase.sh query "SELECT count(*) FROM analytics.events WHERE timestamp > now() - interval '7 days'"
+```
+
+---
+
+## Supabase Warehouse / pg_duckdb
+
+Supabase Warehouse (Feb 2026) embeds DuckDB inside Postgres via the `pg_duckdb` extension, providing up to 600x acceleration for analytics queries without moving data to a separate system.
+
+### Key capabilities
+
+- **600x faster analytics** - columnar scans, vectorized execution, and predicate pushdown inside Postgres
+- **Analytics Buckets** - store cold/warm data in Apache Iceberg format on S3-compatible storage
+- **Standard SQL** - query analytics tables with normal `SELECT` statements, no new syntax
+- **Mixed workloads** - OLTP and OLAP in the same database, same connection
+
+### Enable Warehouse
+
+```sql
+-- Enable the extension (requires Supabase Pro or higher)
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+```
+
+### Analytics Buckets (Iceberg on S3)
+
+Analytics Buckets store large datasets in Iceberg format on S3 for cost-effective, high-performance scans.
+
+```sql
+-- Create an analytics bucket
+SELECT duckdb.install_extension('iceberg');
+
+-- Query an Iceberg table
+SELECT count(*), date_trunc('hour', timestamp) as hour
+FROM analytics.events
+WHERE timestamp > now() - interval '7 days'
+GROUP BY hour
+ORDER BY hour;
+```
+
+### Example queries
+
+```bash
+# Count events in the last week
+{baseDir}/scripts/supabase.sh query "SELECT count(*) FROM analytics.events WHERE timestamp > now() - interval '7 days'"
+
+# Aggregate pageviews by path
+{baseDir}/scripts/supabase.sh query "
+  SELECT path, count(*) as views
+  FROM analytics.pageviews
+  WHERE timestamp > now() - interval '30 days'
+  GROUP BY path
+  ORDER BY views DESC
+  LIMIT 20
+"
+
+# Join analytics data with transactional tables
+{baseDir}/scripts/supabase.sh query "
+  SELECT u.email, count(e.id) as event_count
+  FROM public.users u
+  JOIN analytics.events e ON e.user_id = u.id::text
+  WHERE e.timestamp > now() - interval '7 days'
+  GROUP BY u.email
+  ORDER BY event_count DESC
+  LIMIT 10
+"
+```
+
+---
+
+## Automatic Embeddings
+
+Trigger-based pipeline that automatically generates vector embeddings when rows are inserted or updated. Uses pgmq queues, pg_cron (10-second batches), and Edge Functions for model-agnostic embedding generation.
+
+### How it works
+
+1. A trigger on your table enqueues new/updated rows into a pgmq queue
+2. pg_cron polls the queue every 10 seconds
+3. An Edge Function reads the batch, calls the embedding model, and writes vectors back
+4. Embeddings are searchable via pgvector immediately
+
+### Default model
+
+OpenAI `text-embedding-3-small` (1536 dimensions). You can swap in any model by changing the Edge Function.
+
+### Setup
+
+```sql
+-- 1. Enable required extensions
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pgmq;
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+-- 2. Create the embedding queue
+SELECT pgmq.create('embed_queue');
+
+-- 3. Add a trigger to enqueue rows on insert/update
+CREATE OR REPLACE FUNCTION enqueue_for_embedding()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  PERFORM pgmq.send('embed_queue', jsonb_build_object(
+    'table', TG_TABLE_NAME,
+    'id', NEW.id,
+    'content', NEW.content
+  ));
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER embed_on_change
+  AFTER INSERT OR UPDATE OF content ON documents
+  FOR EACH ROW
+  EXECUTE FUNCTION enqueue_for_embedding();
+
+-- 4. Schedule the batch processor (every 10 seconds)
+SELECT cron.schedule('process-embeddings', '10 seconds',
+  $$SELECT net.http_post(
+    url := current_setting('app.settings.supabase_url') || '/functions/v1/generate-embeddings',
+    headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.settings.service_role_key')),
+    body := '{}'::jsonb
+  )$$
+);
+```
+
+### Example workflow
+
+```bash
+# Insert a document - embedding is auto-generated
+{baseDir}/scripts/supabase.sh insert documents '{"content": "How to configure SSO with SAML providers"}'
+
+# Wait ~10 seconds for the embedding pipeline, then search
+{baseDir}/scripts/supabase.sh vector-search documents "single sign-on setup" --limit 5
+```
+
+---
+
+## Queues / pgmq
+
+Postgres-native message queues via the `pgmq` extension. Exactly-once delivery with configurable visibility windows.
+
+### Key capabilities
+
+- **Exactly-once delivery** - messages are invisible to other consumers during processing
+- **Configurable visibility window** - set how long a message is locked (default 30 seconds)
+- **pgmq_public schema** - safe for client-side consumers via PostgREST
+- **pg_cron integration** - schedule workers to process queues on a cadence
+- **Dead letter queues** - messages that fail repeatedly are moved aside
+
+### Setup
+
+```sql
+-- Enable the extension
+CREATE EXTENSION IF NOT EXISTS pgmq;
+
+-- Create a queue
+SELECT pgmq.create('my_queue');
+
+-- Send a message
+SELECT pgmq.send('my_queue', '{"task": "send_email", "to": "user@example.com"}'::jsonb);
+
+-- Read a message (locks it for 30 seconds)
+SELECT * FROM pgmq.read('my_queue', 30, 1);
+
+-- Delete after processing
+SELECT pgmq.delete('my_queue', <msg_id>);
+
+-- Archive instead of delete (keeps history)
+SELECT pgmq.archive('my_queue', <msg_id>);
+```
+
+### Client-side consumers (pgmq_public)
+
+The `pgmq_public` schema exposes queue operations through PostgREST, so client apps can consume messages via the Supabase REST API.
+
+```bash
+# Read from queue via REST
+curl "${SUPABASE_URL}/rest/v1/rpc/pgmq_public_read" \
+  -H "apikey: ${SUPABASE_API_KEY}" \
+  -H "Authorization: Bearer ${SUPABASE_API_KEY}" \
+  -d '{"queue_name": "my_queue", "vt": 30, "qty": 5}'
+```
+
+### Worker pattern: pgmq + pg_cron + Edge Functions
+
+```sql
+-- Schedule an Edge Function to process the queue every 10 seconds
+SELECT cron.schedule('process-queue', '10 seconds',
+  $$SELECT net.http_post(
+    url := current_setting('app.settings.supabase_url') || '/functions/v1/process-my-queue',
+    headers := jsonb_build_object('Authorization', 'Bearer ' || current_setting('app.settings.service_role_key')),
+    body := '{}'::jsonb
+  )$$
+);
+```
+
+---
+
+## Realtime
+
+Supabase Realtime provides four capabilities for live data synchronization:
+
+### Postgres Changes (WebSocket DB change notifications)
+
+Listen to INSERT, UPDATE, DELETE events on any table via WebSocket. Respects RLS policies.
+
+```javascript
+// Client-side example (supabase-js)
+const channel = supabase
+  .channel('db-changes')
+  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' },
+    (payload) => console.log('New message:', payload.new)
+  )
+  .subscribe();
+```
+
+### Broadcast (ephemeral pub/sub messaging)
+
+Low-latency pub/sub for messages that don't need persistence. Good for typing indicators, cursor positions, game state.
+
+```javascript
+const channel = supabase.channel('room-1');
+channel.on('broadcast', { event: 'cursor' }, (payload) => {
+  console.log('Cursor moved:', payload);
+});
+channel.subscribe();
+channel.send({ type: 'broadcast', event: 'cursor', payload: { x: 100, y: 200 } });
+```
+
+### Presence (shared state, online status)
+
+Track who is online and share ephemeral state across clients.
+
+```javascript
+const channel = supabase.channel('online-users');
+channel.on('presence', { event: 'sync' }, () => {
+  const state = channel.presenceState();
+  console.log('Online:', Object.keys(state));
+});
+channel.subscribe(async (status) => {
+  if (status === 'SUBSCRIBED') {
+    await channel.track({ user_id: 'abc', online_at: new Date().toISOString() });
+  }
+});
+```
+
+### Broadcast from Database (beta)
+
+Trigger Realtime broadcasts directly from SQL using `realtime.send()`. Useful for server-side event broadcasting without client SDKs.
+
+```sql
+-- Send a broadcast from a trigger or function
+SELECT realtime.send(
+  'room-1',          -- channel
+  'new-notification', -- event
+  jsonb_build_object('message', 'You have a new order'), -- payload
+  false               -- is_private
+);
+```
+
+---
+
+## Auth Enhancements
+
+### OAuth 2.1 Server (Nov 2025 beta)
+
+Supabase can now act as an OAuth 2.1 identity provider. Your Supabase project becomes the authorization server, issuing tokens that third-party apps can use.
+
+- PKCE flow by default (no client secrets for public clients)
+- Consent screen management in Dashboard
+- Scopes and token lifetimes configurable per client
+- Enable via Dashboard -> Authentication -> OAuth Applications
+
+### X/Twitter OAuth 2.0 (Feb 2026)
+
+Twitter/X login now uses OAuth 2.0 (replacing the legacy 1.0a flow). Update your provider configuration:
+
+```bash
+# Dashboard -> Authentication -> Providers -> Twitter
+# Switch from OAuth 1.0a to OAuth 2.0
+# Update Client ID and Client Secret from the X Developer Portal
+```
+
+---
+
+## Storage Improvements (March 2026)
+
+### Performance
+
+- **14.8x faster object listing** on large datasets (rewritten listing engine)
+- **Smart CDN** with automatic edge revalidation - no more stale cached files
+
+### Features
+
+- **Image Transformations** - resize, crop, and format-convert images on-the-fly via URL parameters
+- **Resumable Uploads** - TUS protocol support for reliable large file uploads
+- **S3 Compatibility** - use any S3-compatible client or SDK with your Supabase Storage
+
+### Image Transformations example
+
+```bash
+# Original image
+https://yourproject.supabase.co/storage/v1/object/public/images/photo.jpg
+
+# Resize to 200x200
+https://yourproject.supabase.co/storage/v1/render/image/public/images/photo.jpg?width=200&height=200
+
+# Convert to WebP
+https://yourproject.supabase.co/storage/v1/render/image/public/images/photo.jpg?format=webp&quality=80
+```
+
+### S3 Compatibility
+
+```bash
+# Use AWS CLI with Supabase Storage
+aws s3 ls s3://your-bucket/ \
+  --endpoint-url https://yourproject.supabase.co/storage/v1/s3
+
+aws s3 cp ./file.pdf s3://your-bucket/uploads/ \
+  --endpoint-url https://yourproject.supabase.co/storage/v1/s3
+```
+
+---
+
+## Edge Functions
+
+Deno-based serverless functions deployed at the edge, close to your users and database.
+
+### Key capabilities
+
+- **Regional invocations** - run functions near your database for lower latency
+- **Rate limiting on recursive calls** (March 2026) - prevents runaway function chains
+- **NPM compatibility** - import npm packages directly (`import express from "npm:express"`)
+- **WASM support** - run WebAssembly modules inside Edge Functions
+
+### Deploy and invoke
+
+```bash
+# Deploy a function
+supabase functions deploy my-function
+
+# Invoke via curl
+curl -L "${SUPABASE_URL}/functions/v1/my-function" \
+  -H "Authorization: Bearer ${SUPABASE_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{"key": "value"}'
+```
+
+### Regional invocation
+
+```bash
+# Force execution in a specific region (near your database)
+curl -L "${SUPABASE_URL}/functions/v1/my-function" \
+  -H "Authorization: Bearer ${SUPABASE_API_KEY}" \
+  -H "x-region: us-east-1" \
+  -d '{}'
+```
+
+---
+
+## Integrations
+
+### Claude Connector (MCP)
+
+32 MCP tools for Supabase - manage tables, query data, handle auth, and deploy functions directly from Claude or any MCP-compatible agent.
+
+```bash
+# Install the Supabase MCP server
+npx @anthropic-ai/supabase-mcp
+```
+
+### Stripe Sync Engine
+
+Query your Stripe data directly via SQL. The sync engine mirrors Stripe objects (customers, subscriptions, invoices) into your Supabase database.
+
+```sql
+-- Enable the Stripe sync (Dashboard -> Integrations -> Stripe)
+-- Then query Stripe data with SQL
+SELECT id, email, name FROM stripe.customers WHERE created > now() - interval '30 days';
+SELECT subscription_id, status, current_period_end FROM stripe.subscriptions WHERE status = 'active';
+```
+
+### Log Drains (Pro plan)
+
+Stream Supabase logs to external observability platforms:
+
+- **Datadog** - metrics, logs, traces
+- **Grafana / Loki** - log aggregation
+- **Sentry** - error tracking
+- **Axiom** - log analytics
+- **S3** - raw log archival
+
+Configure via Dashboard -> Settings -> Log Drains.
+
+### PrivateLink for AWS VPC (Jan 2026)
+
+Connect your Supabase project to your AWS VPC via AWS PrivateLink. Database traffic stays on the AWS backbone, never traversing the public internet.
+
+Configure via Dashboard -> Settings -> Network -> PrivateLink.
+
+---
+
+## Database Branching
+
+Create isolated database branches for preview environments. Each branch is a full copy of your schema with optional seed data.
+
+```bash
+# Create a branch (via Supabase CLI)
+supabase branches create feat/new-feature
+
+# Branch gets its own URL and keys
+# Use in CI/CD for preview deployments
+```
+
+Branches are linked to Git branches. Merge the Git branch and the database branch is promoted or discarded.
+
+---
+
+## Read Replicas
+
+Deploy read-only replicas in different regions for lower latency reads.
+
+```bash
+# Create a read replica (via Dashboard -> Settings -> Infrastructure -> Read Replicas)
+# Each replica gets its own connection string
+
+# Use in your app for read-heavy queries
+export SUPABASE_DB_READ_URL="postgresql://postgres:[PASSWORD]@db-replica.[REF].supabase.co:5432/postgres"
+```
+
+---
+
+## Supabase Vault
+
+Encrypted secrets storage inside Postgres. Store API keys, tokens, and sensitive config without exposing them in application code.
+
+```sql
+-- Store a secret
+SELECT vault.create_secret('my-api-key', 'sk-abc123...', 'API key for external service');
+
+-- Retrieve a secret
+SELECT * FROM vault.decrypted_secrets WHERE name = 'my-api-key';
+
+-- Use in functions
+CREATE OR REPLACE FUNCTION call_external_api()
+RETURNS json
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  api_key text;
+BEGIN
+  SELECT decrypted_secret INTO api_key FROM vault.decrypted_secrets WHERE name = 'my-api-key';
+  -- use api_key in your request
+END;
+$$;
 ```
 
 ---
@@ -362,7 +847,7 @@ Options:
 {baseDir}/scripts/supabase.sh vector-search faq "billing questions" --match-fn search_faq --limit 20
 ```
 
-Requires `OPENAI_API_KEY` for embedding generation (uses text-embedding-ada-002, 1536 dimensions).
+Requires `OPENAI_API_KEY` for embedding generation (uses text-embedding-3-small, 1536 dimensions).
 
 ### Setup: Enable pgvector
 
@@ -705,14 +1190,14 @@ Supabase began deprecating legacy API keys on March 11, 2026. Here is what you n
 
 | Key Type | Old Format | New Format | Status |
 |----------|-----------|------------|--------|
-| Service role | `eyJhbGciOiJIUzI1NiIs...` (JWT) | `sbp_...` (project-scoped) | Legacy works until late 2026 |
-| Anon key | `eyJhbGciOiJIUzI1NiIs...` (JWT) | `sbp_...` (project-scoped) | Legacy works until late 2026 |
+| Service role | `eyJhbGciOiJIUzI1NiIs...` (JWT) | `sb_secret_...` (project-scoped) | Legacy works until late 2026 |
+| Publishable | `eyJhbGciOiJIUzI1NiIs...` (JWT) | `sb_publishable_...` (project-scoped) | Legacy works until late 2026 |
 | Access token | `sbp_...` | No change | Already uses new format |
 
 ### Step-by-step migration
 
 1. Go to your Supabase Dashboard -> Settings -> API -> API Keys
-2. Copy your new project-scoped service key (starts with `sbp_`)
+2. Copy your new project-scoped service key (starts with `sb_secret_`)
 3. Update your environment:
 
 ```bash
@@ -720,7 +1205,7 @@ Supabase began deprecating legacy API keys on March 11, 2026. Here is what you n
 export SUPABASE_SERVICE_KEY="eyJhbGciOiJIUzI1NiIs..."
 
 # New way (preferred)
-export SUPABASE_API_KEY="sbp_..."
+export SUPABASE_API_KEY="sb_secret_..."
 ```
 
 4. The skill auto-detects which key you are using. Both work during the transition period.
@@ -755,7 +1240,7 @@ Error: Invalid API key
 ```
 
 - Check that `SUPABASE_SERVICE_KEY` or `SUPABASE_API_KEY` is set correctly
-- Service keys should start with `eyJ` (legacy JWT) or `sbp_` (new project-scoped)
+- Service keys should start with `eyJ` (legacy JWT) or `sb_secret_` (new project-scoped)
 - Keys are project-specific - make sure you are using the right one
 
 ### Query errors
@@ -874,8 +1359,11 @@ done < queries.txt
 
 - Service role key bypasses RLS (Row Level Security) - use anon key for client-side access
 - Vector search requires pgvector extension and a match function in your database
-- Embeddings default to OpenAI text-embedding-ada-002 (1536 dimensions)
+- Embeddings default to OpenAI text-embedding-3-small (1536 dimensions)
 - Direct SQL via `query` requires an `exec_sql` function (see Error Recovery section)
 - Migrations and health checks work best with `SUPABASE_DB_URL` for direct Postgres access
 - All REST API calls go through PostgREST at `SUPABASE_URL/rest/v1`
-- The skill supports both legacy JWT keys and new project-scoped `sbp_` keys
+- The skill supports both legacy JWT keys and new project-scoped `sb_secret_` / `sb_publishable_` keys
+- Warehouse analytics (pg_duckdb) requires Supabase Pro or higher
+- Automatic embeddings pipeline uses pgmq + pg_cron + Edge Functions
+- OpenAPI spec is restricted to service_role keys as of March 11, 2026
